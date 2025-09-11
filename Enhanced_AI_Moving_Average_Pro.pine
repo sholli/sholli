@@ -1,0 +1,377 @@
+//@version=5
+indicator(title="Enhanced AI Moving Average Pro", shorttitle="E-AI MA Pro", overlay=true, max_labels_count=500, max_lines_count=500)
+
+// ====================================================================================================================================================================================================
+// ===                                                                         INPUTS                                                                                                             ===
+// ====================================================================================================================================================================================================
+var g_perf = "0. Performance"
+lightMode = input.bool(false, title="Enable Light Mode", tooltip="Disables heavier calculations like Support/Resistance detection for faster performance.", group=g_perf)
+
+var g_ma = "1. Moving Average"
+ma_type = input.string(title="MA Type", defval="EMA", options=["SMA", "EMA", "WMA", "TEMA", "HMA"], group=g_ma)
+ma_length = input.int(title="MA Length", defval=21, minval=1, group=g_ma)
+ma_source = input.source(title="MA Source", defval=close, group=g_ma)
+proactive_factor = input.float(title="Proactive Factor", defval=0.6, minval=0.0, maxval=1.0, step=0.1, group=g_ma, tooltip="Controls the lead of the proactive MA. 0.0 = same as base MA, 1.0 = fastest response.")
+
+var g_filters = "2. Confirmation Filters"
+use_vwap = input.bool(title="Use VWAP Filter", defval=true, group=g_filters)
+use_regime_filter = input.bool(title="Use Market Regime Filter", defval=true, group=g_filters, tooltip="Filters for signals that occur during a trending market regime (ADX > 20).")
+use_sr_proximity_filter = input.bool(title="Use S/R Proximity Filter", defval=true, group=g_filters, tooltip="Prevents entries if price is too close to a strong, opposing S/R level.")
+vwap_session = input.string(title="VWAP Period", defval="session", options=["session", "day", "week", "month"], group=g_filters)
+volume_sma_len = input.int(title="Volume SMA Length", defval=20, minval=1, group=g_filters)
+volume_multiplier = input.float(title="Volume Multiplier", defval=1.5, minval=1.0, group=g_filters)
+liquidity_sweep_wick_ratio = input.float(title="Liquidity Sweep Wick Ratio (Wick/Body)", defval=1.5, minval=0.1, group=g_filters)
+
+var g_sr = "3. Support & Resistance"
+sr_lookback = input.int(title="S/R Lookback", defval=15, minval=5, group=g_sr)
+sr_strength = input.int(title="S/R Strength (Pivot Touches)", defval=2, minval=1, group=g_sr)
+atr_for_levels_len = input.int(title="ATR for Level Normalization", defval=100, minval=1, group=g_sr, tooltip="ATR used to filter out S/R levels that are too close together.")
+
+var g_trade = "4. Trade Assistant"
+entry_on_confirmed_close = input.bool(title="Entry on Confirmed Close", defval=true, group=g_trade)
+use_sr_for_sl = input.bool(title="Use S/R for Stop Loss", defval=false, group=g_trade, tooltip="If checked, the Stop Loss will be placed at the nearest strong S/R level instead of using the ATR multiplier.")
+default_ATR_mult_SL = input.float(title="Default ATR Multiplier for SL", defval=1.5, minval=0.1, group=g_trade)
+default_ATR_mult_TP = input.float(title="Default ATR Multiplier for TP", defval=2.5, minval=0.1, group=g_trade)
+
+var g_session = "5. Session Control"
+show_sessions = input.bool(title="Use Session Filter", defval=false, group=g_session)
+session_start = input.string(title="Session Start (HH:MM)", defval="09:30", group=g_session)
+session_end = input.string(title="Session End (HH:MM)", defval="16:00", group=g_session)
+max_signals_per_session = input.int(title="Max Signals Per Session", defval=3, minval=1, group=g_session)
+
+var g_viz = "6. Visuals & Debug"
+plot_arrows = input.bool(title="Plot Buy/Sell Arrows", defval=true, group=g_viz)
+arrow_size_input = input.string("Small", "Arrow Size", options=["Tiny", "Small", "Normal", "Large", "Huge"], group=g_viz)
+show_stop_loss = input.bool(title="Show SL/TP Lines", defval=true, group=g_viz)
+show_take_profit = input.bool(title="Show Take Profit", defval=true, group=g_viz)
+debug_mode = input.bool(title="Enable Debug Mode", defval=false, group=g_viz)
+
+// ====================================================================================================================================================================================================
+// ===                                                                  CORE CALCULATIONS                                                                                                           ===
+// ====================================================================================================================================================================================================
+
+// --- Moving Average Calculation ---
+f_getMA(source, length, type) =>
+    float ma = switch type
+        "SMA" => ta.sma(source, length)
+        "EMA" => ta.ema(source, length)
+        "WMA" => ta.wma(source, length)
+        "HMA" => ta.hma(source, length)
+        "TEMA" =>
+            ema1 = ta.ema(source, length)
+            ema2 = ta.ema(ema1, length)
+            ema3 = ta.ema(ema2, length)
+            3 * ema1 - 3 * ema2 + ema3
+    ma
+
+ma = f_getMA(ma_source, ma_length, ma_type)
+lead_ma_len = math.max(1, math.round(ma_length * (1 - proactive_factor)))
+lead_ma = ta.ema(ma_source, lead_ma_len)
+
+ma_slope_period = math.max(1, math.round(ma_length / 4))
+ma_slope = ma - ma[ma_slope_period]
+atr_for_slope = ta.atr(ma_slope_period)
+normalized_slope = atr_for_slope > 0 ? ma_slope / atr_for_slope : 0
+trend_up = ma_slope > 0
+trend_down = ma_slope < 0
+
+// --- Other Core Calculations ---
+volume_sma = ta.sma(volume, volume_sma_len)
+high_volume = volume >= volume_multiplier * volume_sma
+
+session_string = session_start + "-" + session_end + ":1234567"
+in_session = not na(time(timeframe.period, session_string))
+is_new_vwap_session = switch vwap_session
+    "day" => timeframe.change("D")
+    "week" => timeframe.change("W")
+    "month" => timeframe.change("M")
+    => in_session and not in_session[1]
+var float vwap_sum = 0
+var float vol_sum = 0
+vwap_sum := is_new_vwap_session ? ma_source * volume : vwap_sum + ma_source * volume
+vol_sum := is_new_vwap_session ? volume : vol_sum + volume
+vwap_value = vol_sum > 0 ? vwap_sum / vol_sum : na
+
+[di_plus, di_minus, adx] = ta.dmi(14, 14)
+atr_for_regime = ta.atr(atr_for_levels_len)
+atr_long_sma = ta.sma(atr_for_regime, 50)
+atr_ratio = atr_long_sma > 0 ? atr_for_regime / atr_long_sma : 0
+is_trending_regime = adx > 20 and atr_ratio > 1.05
+
+// ====================================================================================================================================================================================================
+// ===                                                                  PLOTS AND VISUALS                                                                                                         ===
+// ====================================================================================================================================================================================================
+plot(ma, "Base MA", color=trend_up ? color.new(color.green, 0) : color.new(color.red, 0), linewidth=2)
+plot(lead_ma, "Lead MA", color=color.new(color.gray, 50), style=plot.style_linebr, linewidth=1)
+plot(use_vwap ? vwap_value : na, "VWAP", color=color.new(color.blue, 20), linewidth=2)
+
+// ====================================================================================================================================================================================================
+// ===                                                               ADVANCED ANALYSIS ENGINES                                                                                                      ===
+// ====================================================================================================================================================================================================
+
+// --- Helper Functions ---
+f_get_sr_stop(is_buy) =>
+    float sr_stop_price = na
+    sr_array = is_buy ? sr_lows : sr_highs
+    float best_distance = 1e9
+
+    for i = 0 to array.size(sr_array) - 1
+        level = array.get(sr_array, i)
+        is_valid_level = (is_buy and level.price < close) or (not is_buy and level.price > close)
+
+        if level.strength >= sr_strength and is_valid_level
+            distance = math.abs(close - level.price)
+            if distance < best_distance
+                best_distance := distance
+                sr_stop_price := level.price
+
+    if not na(sr_stop_price)
+        buffer = atr_for_sr_norm * 0.1
+        sr_stop_price := is_buy ? sr_stop_price - buffer : sr_stop_price + buffer
+
+    sr_stop_price
+
+f_is_near_sr(is_buy) =>
+    float distance_threshold = atr_for_sr_norm * 0.3
+    bool too_close = false
+    sr_array = is_buy ? sr_highs : sr_lows
+    price_to_check = is_buy ? high : low
+
+    for i = 0 to array.size(sr_array) - 1
+        level = array.get(sr_array, i)
+        is_relevant_level = (is_buy and level.price > price_to_check) or (not is_buy and level.price < price_to_check)
+        if level.strength >= sr_strength and is_relevant_level
+            if math.abs(price_to_check - level.price) < distance_threshold
+                too_close := true
+                break
+    too_close
+
+f_getArrowSize(size_string) =>
+    switch size_string
+        "Tiny" => size.tiny
+        "Small" => size.small
+        "Normal" => size.normal
+        "Large" => size.large
+        "Huge" => size.huge
+
+// --- Support & Resistance Engine ---
+type SRLevel
+    float price
+    int strength
+    int last_test_bar
+    int first_test_bar
+    line sr_line
+
+var sr_highs = array.new<SRLevel>(0)
+var sr_lows = array.new<SRLevel>(0)
+var bool sr_levels_changed = false
+atr_for_sr_norm = ta.atr(atr_for_levels_len)
+
+f_updateSRLevels(bool isHigh, float level, int bar) =>
+    sr_array = isHigh ? sr_highs : sr_lows
+    bool found = false
+    if array.size(sr_array) > 0
+        for i = 0 to array.size(sr_array) - 1
+            existing_level = array.get(sr_array, i)
+            if math.abs(level - existing_level.price) < (atr_for_sr_norm * 0.25)
+                existing_level.strength += 1
+                existing_level.last_test_bar := bar
+                line.set_x2(existing_level.sr_line, bar_index)
+                array.set(sr_array, i, existing_level)
+                found := true
+                sr_levels_changed := true
+                break
+    if not found
+        newLine = line.new(bar, level, bar + 1, level, color=na, style=line.style_dashed)
+        array.push(sr_array, SRLevel.new(level, 1, bar, bar, newLine))
+        sr_levels_changed := true
+    if array.size(sr_array) > 20
+        SRLevel oldest_level = array.shift(sr_array)
+        line.delete(oldest_level.sr_line)
+
+f_findStrongestIndex(arr) =>
+    int strongest_index = -1
+    int max_strength = -1
+    if array.size(arr) > 0
+        for i = 0 to array.size(arr) - 1
+            if array.get(arr, i).strength > max_strength
+                max_strength := array.get(arr, i).strength
+                strongest_index := i
+    strongest_index
+
+f_update_sr_visibility() =>
+    for i = 0 to array.size(sr_highs) - 1
+        line.set_color(array.get(sr_highs, i).sr_line, na)
+    for i = 0 to array.size(sr_lows) - 1
+        line.set_color(array.get(sr_lows, i).sr_line, na)
+
+    highs_copy = array.copy(sr_highs)
+    for i = 0 to 3
+        strongest_h_idx = f_findStrongestIndex(highs_copy)
+        if strongest_h_idx > -1
+            level_to_show = array.get(highs_copy, strongest_h_idx)
+            if level_to_show.strength >= sr_strength
+                line.set_color(level_to_show.sr_line, color.new(color.red, 50))
+            array.remove(highs_copy, strongest_h_idx)
+        else
+            break
+
+    lows_copy = array.copy(sr_lows)
+    for i = 0 to 3
+        strongest_l_idx = f_findStrongestIndex(lows_copy)
+        if strongest_l_idx > -1
+            level_to_show = array.get(lows_copy, strongest_l_idx)
+            if level_to_show.strength >= sr_strength
+                line.set_color(level_to_show.sr_line, color.new(color.green, 50))
+            array.remove(lows_copy, strongest_l_idx)
+        else
+            break
+
+// --- Liquidity Sweep Detection ---
+wick_size = high - low
+body_size = math.abs(open - close)
+wick_ratio_ok = body_size > 0 ? wick_size / body_size >= liquidity_sweep_wick_ratio : false
+
+// Bullish Sweep Logic
+is_potential_bull_sweep = high_volume and wick_ratio_ok and low < ta.lowest(low, 5)[1]
+last_bull_sweep_high = ta.valuewhen(is_potential_bull_sweep, high, 0)
+last_bull_sweep_bar_idx = ta.valuewhen(is_potential_bull_sweep, bar_index, 0)
+bars_since_bull_sweep = bar_index - last_bull_sweep_bar_idx
+confirmed_bull_sweep = not na(last_bull_sweep_high) and close > last_bull_sweep_high and bars_since_bull_sweep > 0 and bars_since_bull_sweep <= 3
+
+// Bearish Sweep Logic
+is_potential_bear_sweep = high_volume and wick_ratio_ok and high > ta.highest(high, 5)[1]
+last_bear_sweep_low = ta.valuewhen(is_potential_bear_sweep, low, 0)
+last_bear_sweep_bar_idx = ta.valuewhen(is_potential_bear_sweep, bar_index, 0)
+bars_since_bear_sweep = bar_index - last_bear_sweep_bar_idx
+confirmed_bear_sweep = not na(last_bear_sweep_low) and close < last_bear_sweep_low and bars_since_bear_sweep > 0 and bars_since_bear_sweep <= 3
+
+
+// Main S/R logic execution block
+if not lightMode
+    sr_levels_changed := false
+    pivot_high = ta.pivothigh(sr_lookback, sr_lookback)
+    pivot_low = ta.pivotlow(sr_lookback, sr_lookback)
+    if not na(pivot_high)
+        f_updateSRLevels(true, pivot_high, bar_index[sr_lookback])
+    if not na(pivot_low)
+        f_updateSRLevels(false, pivot_low, bar_index[sr_lookback])
+
+    if sr_levels_changed or barstate.islast
+        f_update_sr_visibility()
+
+// ====================================================================================================================================================================================================
+// ===                                                                   SIGNAL LOGIC                                                                                                             ===
+// ====================================================================================================================================================================================================
+is_new_trade_session = timeframe.change("D")
+var signals_today = 0
+if is_new_trade_session
+    signals_today := 0
+var lastSignalDirection = 0
+
+// --- Core Triggers ---
+price_above_ma = close > ma
+confirmation_buy = high_volume or confirmed_bull_sweep
+core_buy_trigger = trend_up and price_above_ma and confirmation_buy
+
+price_below_ma = close < ma
+confirmation_sell = high_volume or confirmed_bear_sweep
+core_sell_trigger = trend_down and price_below_ma and confirmation_sell
+
+// --- Filters ---
+vwap_filter_buy = use_vwap ? close > vwap_value : true
+vwap_filter_sell = use_vwap ? close < vwap_value : true
+session_filter = show_sessions ? in_session : true
+signal_count_filter = signals_today < max_signals_per_session
+regime_filter = use_regime_filter ? is_trending_regime : true
+sr_proximity_filter_buy = use_sr_proximity_filter and not lightMode ? not f_is_near_sr(true) : true
+sr_proximity_filter_sell = use_sr_proximity_filter and not lightMode ? not f_is_near_sr(false) : true
+
+// --- Condition Assembly ---
+buy_condition = core_buy_trigger and vwap_filter_buy and session_filter and signal_count_filter and regime_filter and sr_proximity_filter_buy
+sell_condition = core_sell_trigger and vwap_filter_sell and session_filter and signal_count_filter and regime_filter and sr_proximity_filter_sell
+
+// --- Signal Generation ---
+buy_signal = buy_condition and lastSignalDirection != 1
+sell_signal = sell_condition and lastSignalDirection != -1
+
+if buy_signal
+    lastSignalDirection := 1
+    signals_today += 1
+
+if sell_signal
+    lastSignalDirection := -1
+    signals_today += 1
+
+// ====================================================================================================================================================================================================
+// ===                                                               TRADE LIFECYCLE & VISUALS                                                                                                      ===
+// ====================================================================================================================================================================================================
+var int trade_direction = 0
+var float sl_price = na
+var float tp_price = na
+var line sl_line = na
+var line tp_line = na
+atr_for_trade = ta.atr(14)
+
+// --- Lifecycle Management: Check for SL/TP hit ---
+bool trade_just_closed = false
+if trade_direction == 1 and (low <= sl_price or high >= tp_price)
+    line.delete(sl_line)
+    line.delete(tp_line)
+    sl_line := na
+    tp_line := na
+    trade_direction := 0
+    trade_just_closed := true
+else if trade_direction == -1 and (high >= sl_price or low <= tp_price)
+    line.delete(sl_line)
+    line.delete(tp_line)
+    sl_line := na
+    tp_line := na
+    trade_direction := 0
+    trade_just_closed := true
+
+// --- Lifecycle Management: New Signal ---
+if buy_signal and not trade_just_closed
+    if not na(sl_line)
+        line.delete(sl_line)
+    if not na(tp_line)
+        line.delete(tp_line)
+
+    trade_direction := 1
+    sl_price_sr = f_get_sr_stop(true)
+    sl_price_atr = close - atr_for_trade * default_ATR_mult_SL
+    sl_price := use_sr_for_sl and not na(sl_price_sr) ? sl_price_sr : sl_price_atr
+    tp_price := close + atr_for_trade * default_ATR_mult_TP
+
+    if show_stop_loss
+        sl_line := line.new(bar_index, sl_price, bar_index + 100, sl_price, color=color.new(color.red, 20), style=line.style_dashed)
+    if show_take_profit
+        tp_line := line.new(bar_index, tp_price, bar_index + 100, tp_price, color=color.new(color.green, 20), style=line.style_dashed)
+
+if sell_signal and not trade_just_closed
+    if not na(sl_line)
+        line.delete(sl_line)
+    if not na(tp_line)
+        line.delete(tp_line)
+
+    trade_direction := -1
+    sl_price_sr = f_get_sr_stop(false)
+    sl_price_atr = close + atr_for_trade * default_ATR_mult_SL
+    sl_price := use_sr_for_sl and not na(sl_price_sr) ? sl_price_sr : sl_price_atr
+    tp_price := close - atr_for_trade * default_ATR_mult_TP
+
+    if show_stop_loss
+        sl_line := line.new(bar_index, sl_price, bar_index + 100, sl_price, color=color.new(color.red, 20), style=line.style_dashed)
+    if show_take_profit
+        tp_line := line.new(bar_index, tp_price, bar_index + 100, tp_price, color=color.new(color.green, 20), style=line.style_dashed)
+
+// --- Plotting Arrows ---
+arrow_size = f_getArrowSize(arrow_size_input)
+plotshape(plot_arrows and buy_signal and not trade_just_closed, "Buy", shape.triangleup, location.belowbar, color.green, size=arrow_size)
+plotshape(plot_arrows and sell_signal and not trade_just_closed, "Sell", shape.triangledown, location.abovebar, color.red, size=arrow_size)
+
+// ====================================================================================================================================================================================================
+// ===                                                                       ALERTS                                                                                                               ===
+// ====================================================================================================================================================================================================
+alertcondition(buy_signal and not trade_just_closed, "E-AI MA Pro Buy Signal", "BUY signal on {{ticker}} at {{close}}")
+alertcondition(sell_signal and not trade_just_closed, "E-AI MA Pro Sell Signal", "SELL signal on {{ticker}} at {{close}}")
